@@ -1,86 +1,87 @@
-import yfinance as yf
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import Sequential
+import math
+
 import numpy as np
+import tensorflow as tf
+import yfinance as yf
+import pandas_datareader as pdr
+import datetime as dt
+import pandas as pd
 
-def get_data(ticker, start, end):
-    # Fetch stock data using yfinance library
-    data = yf.download(ticker, start=start, end=end)
-    # Normalize the stock price data
-    data['Close'] = (data['Close'] - data['Close'].mean()) / data['Close'].std()
-    # Normalize the trade volume data
-    data['Volume'] = (data['Volume'] - data['Volume'].mean()) / data['Volume'].std()
-    return data
-
-def build_model(input_shape):
-    model = Sequential()
-    model.add(LSTM(64, input_shape=(input_shape[0], input_shape[1]), return_sequences=True))
-    model.add(LSTM(32))
-    model.add(Dense(1))
-    model.compile(loss='mean_squared_error', optimizer='adam')
-    return model
-
-def split_data(data, train_ratio=0.8):
-    train_size = int(data.shape[0] * train_ratio)
-    train_data = data[:train_size]
-    test_data = data[train_size:]
-    return train_data, test_data
-
-def predict_prices(model, data, window_size=5):
-    X, Y = [], []
-    for i in range(len(data) - window_size):
-        X.append(data[i:i + window_size, :])
-        Y.append(data[i + window_size, 0])
-    X = np.array(X)
-    Y = np.array(Y)
-    predictions = model.predict(X)
-    return predictions, Y
-
-def evaluate_model(model, test_data, window_size=5):
-    # Predict future prices using the trained model
-    predictions, Y = predict_prices(model, test_data, window_size)
-    # Evaluate the model by computing the mean squared error
-    mse = tf.keras.losses.mean_squared_error(predictions, Y).numpy()
-    return mse
-
-def simulate_trading(model, test_data):
-    budget = 1000
-    stock_holding = 0
-    for i in range(1, test_data.shape[0]):
-        # Predict the next price
-        input_data = np.reshape(test_data[i-1, :], (1, test_data.shape[1], 1))
-        prediction = model.predict(input_data)
-        # Buy the stock if the prediction is positive and budget exists
-        if prediction > 0 and budget > 0:
-            stock_holding += budget / test_data[i, 0]
-            budget = 0
-        # Sell the stock if the prediction is negative and stock holding exists
-        if prediction < 0 and stock_holding > 0:
-            budget += stock_holding * test_data[i, 0]
-            stock_holding = 0
-    # Return the final profit
-    profit = budget + stock_holding * test_data[-1, 0] - 1000
-    return profit
-
-# Define the stock ticker and the data interval
+input_days = 10
+output_days = 1
 ticker = '035420.KS'
-interval = '1h'
-start = '2020-01-01'
-end = '2023-02-01'
-# Get the stock data
-data = get_data(ticker, start, end)
-# Prepare the data for training and testing
-data = np.column_stack((data['Close'].values, data['Volume'].values))
-train_data, test_data = split_data(data)
-# Build and compile the model
-input_shape = (train_data.shape[1], train_data.shape[1])
-model = build_model(input_shape)
-# Train the model
-model.fit(train_data, train_data[:, 0], epochs=10, batch_size=32, verbose=0)
-# Evaluate the model on the test data
-mse = evaluate_model(model, test_data)
-print(f'Mean Squared Error: {mse:.4f}')
-# Simulate the trading using the model
-profit = simulate_trading(model, test_data)
-print(f'Profit: ${profit:.2f}')
+start_date = dt.datetime(2021,3,1)
+end_date = dt.datetime(2022,8,1)
+
+test_date_start = dt.datetime(2022,9,1)
+test_date = dt.datetime(2023,1,25)
+
+def fetch_data(ticker, interval, start, end):
+    __raw_data = yf.download(ticker, interval=interval, start=start, end=end)
+    # normalize data
+    __raw_data = (__raw_data-__raw_data.mean()) / __raw_data.std()
+    # splits data into days
+    __split_data = split_dataframe(__raw_data,6)
+    for _ in range(len(__split_data)%(input_days+output_days)):
+        __split_data.pop(0)
+    #__split_data = np.array_split(__raw_data, math.ceil(len(__raw_data)/6))
+    #__filtered_split_data = [array for array in __split_data if array.shape[0] == 6]
+    return __split_data
+
+def split_dataframe(df, chunk_size = 10000):
+    chunks = list()
+    num_chunks = math.ceil(len(df)/chunk_size)
+    for i in range(num_chunks):
+        chunks.append(df[i*chunk_size:(i+1)*chunk_size])
+    return chunks
+
+def process_data(data):
+    # split data per range
+    __split_data = split_dataframe(data, input_days+output_days)
+
+    __train_input, __train_output = [], []
+    for _data in __split_data:
+        __train_input.append(_data[:input_days])
+        new_i = []
+        for i in _data[input_days:]:
+            new_i.append(i.values[0])
+        __train_output.append(new_i)
+
+    return __train_input, __train_output
+
+def build_model():
+    __model = tf.keras.Sequential()
+    __model.add(tf.keras.layers.Dense(128))
+    __model.add(tf.keras.layers.Dense(128, activation='relu'))
+    __model.add(tf.keras.layers.Dense(256, activation='relu'))
+    __model.add(tf.keras.layers.Dense(64, activation='sigmoid'))
+    __model.add(tf.keras.layers.Dense(6*output_days, activation='sigmoid'))
+    __model.compile(loss='mean_squared_error', optimizer='adam', metrics=['accuracy'])
+    return __model
+
+def train_model(__model, __input, __output):
+    __input = np.array(__input)
+    __output = np.array(__output)
+    __input = tf.convert_to_tensor(__input.reshape((len(__input),input_days,6*6)))
+    __output = tf.convert_to_tensor(__output)
+    __model.fit(__input, __output, epochs= 100, batch_size=128)
+
+def test_model(_model):
+    test_data = fetch_data(ticker, '1h', test_date_start, test_date)
+    test_input, test_output = process_data(test_data)
+    predictions = []
+    deviations = [0]*100
+    for i in range(len(test_input)):
+        predictions.append(_model.predict(tf.convert_to_tensor(np.array(test_input).reshape((len(test_input),input_days,6*6)))))
+    for i in range(len(predictions)):
+        for j in range(len(predictions[0][i])):
+            deviations[i] += math.fabs(predictions[0][i][j]-test_output[0][i][j])
+        deviations[i] = deviations[i] / len(predictions[0][i])
+    print(deviations[:10])
+
+
+data = fetch_data(ticker, '1h', start_date, end_date)
+train_input, train_output = process_data(data)
+model = build_model()
+train_model(model, __input=train_input, __output=train_output)
+# test_model(model)
